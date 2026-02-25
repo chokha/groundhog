@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+orats_cache/
+nq_1m.parquet
+nq_1m_databento.parquet
+backtest_output/
+daily_briefs/
