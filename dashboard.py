@@ -42,6 +42,7 @@ from orb import compute_orb
 from ict import load_nq_data, compute_ict_levels, get_all_ict_levels_as_list
 from earnings_calendar import check_earnings_today
 from playbook import match_patterns, format_playbook_matches
+from learn import load_live_intelligence
 
 
 # ─── VIX classification ─────────────────────────────────────────────────────
@@ -1668,6 +1669,11 @@ def generate_and_print_brief(
         premarket_plan["sim_mode"] = True
     _print_premarket_plan(premarket_plan)
 
+    # ── 3a. Prior session context ─────────────────────────────────────────
+    prior_journal = _load_prior_journal(trade_date)
+    if prior_journal:
+        _print_prior_session(prior_journal)
+
     # ── 3b. Playbook pattern matching ─────────────────────────────────────
     try:
         playbook_matches = match_patterns(premarket_plan)
@@ -1675,8 +1681,19 @@ def generate_and_print_brief(
         print(f"  [WARN] Playbook matching failed: {e}")
         playbook_matches = []
 
+    # Load scorecard + decay warnings for live intelligence
+    scorecard = {}
+    decay_warnings = []
+    try:
+        intel = load_live_intelligence()
+        scorecard = intel["scorecard"]
+        decay_warnings = intel["decay_warnings"]
+    except Exception:
+        pass
+
     if playbook_matches:
-        print(format_playbook_matches(playbook_matches))
+        print(format_playbook_matches(playbook_matches, scorecard=scorecard,
+                                      decay_warnings=decay_warnings))
 
     # ── 4. If ORB closed: compute ORB + compose + print ORB EXECUTION PLAN ──
 
@@ -1756,6 +1773,14 @@ def generate_and_print_brief(
     if orb_plan:
         combined["orb_plan"] = orb_plan
 
+    combined["prior_session"] = {
+        "date": prior_journal["date"],
+        "orb_break_dir": prior_journal.get("outcome", {}).get("orb_break_dir"),
+        "day_range": prior_journal.get("outcome", {}).get("day_range"),
+        "t1_hit": prior_journal.get("outcome", {}).get("t1_hit"),
+        "lesson": prior_journal.get("lesson"),
+    } if prior_journal else None
+
     td_str = str(trade_date)
     Path(output_dir).mkdir(exist_ok=True)
     json_path = f"{output_dir}/brief_{td_str}.json"
@@ -1803,6 +1828,48 @@ def _print_flow_debug(ndx_flow, qqq_flow, flow_walls, spot_ndx, spot_nq, basis):
 
 
 # ─── Utilities ───────────────────────────────────────────────────────────────
+
+def _load_prior_journal(trade_date):
+    """Load yesterday's journal entry. Returns dict or None."""
+    prior = get_prior_trading_date(trade_date)
+    path = Path("journal") / f"{prior}.json"
+    if not path.exists():
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+
+def _print_prior_session(entry):
+    """Print prior session context block."""
+    o = entry.get("outcome", {})
+    d = entry.get("date", "?")
+
+    brk = o.get("orb_break_dir", "none")
+    brk_time = o.get("orb_break_time", "?")
+    day_range = o.get("day_range", "?")
+    t1 = "HIT" if o.get("t1_hit") else "MISS"
+    runner = "HIT" if o.get("runner_hit") else "MISS"
+    mfe = o.get("mfe_from_orb_break")
+    mae = o.get("mae_from_orb_break")
+    patterns = entry.get("matched_patterns", [])
+    lesson = entry.get("lesson")
+
+    print(f"\n  -- PRIOR SESSION ({d}) ──────────────────────────────")
+    print(f"  ORB Break: {brk.upper() if brk else 'NONE'} @ {brk_time}  |  "
+          f"Day Range: {day_range} pts")
+
+    mfe_str = f"MFE: +{mfe:.0f}" if mfe is not None else "MFE: ---"
+    mae_str = f"MAE: -{mae:.0f}" if mae is not None else "MAE: ---"
+    print(f"  T1: {t1}  |  Runner: {runner}  |  {mfe_str}  {mae_str}")
+
+    if patterns:
+        print(f"  Patterns: {', '.join(patterns[:3])}")
+    if lesson:
+        print(f"  Lesson: {lesson}")
+
 
 def _append_csv(b: dict, path: str):
     """Append brief as a row to the running daily log CSV."""
@@ -1862,7 +1929,15 @@ def main():
                         help="Sim time HH:MM ET (triggers sim mode)")
     parser.add_argument("--parquet", type=str, default=None,
                         help="Parquet file for legacy backtest mode")
+    parser.add_argument("--journal", action="store_true",
+                        help="Generate post-game journal entry")
     args = parser.parse_args()
+
+    if args.journal:
+        from journal import generate_journal
+        d = args.date or str(detect_trade_date()[0])
+        generate_journal(d)
+        return
 
     if args.parquet and args.date:
         # Legacy parquet backtest

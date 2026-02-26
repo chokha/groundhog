@@ -249,6 +249,61 @@ def compute_pattern_scorecard(entries, playbook):
     return scorecard
 
 
+# ─── Dashboard fast-path loaders ──────────────────────────────────────────
+
+def load_scorecard_cache():
+    """Load all journals, enrich, compute scorecard. Returns dict keyed by pattern_id."""
+    result = load_live_intelligence()
+    return result["scorecard"]
+
+
+def load_live_intelligence():
+    """Load journals once, compute scorecard + decay warnings. Returns dict with both."""
+    entries = load_all_journals()
+    if not entries:
+        return {"scorecard": {}, "decay_warnings": []}
+    enriched = [enrich_journal_entry(e) for e in entries if _is_sane_outcome(e.get("outcome", {}))]
+    usable = [e for e in enriched if e.get("outcome_score") is not None]
+    if not usable:
+        return {"scorecard": {}, "decay_warnings": []}
+    playbook = load_playbook()
+    scorecard = compute_pattern_scorecard(usable, playbook)
+    decay_warnings = compute_pattern_decay(usable, playbook)
+    return {
+        "scorecard": {s["pattern_id"]: s for s in scorecard},
+        "decay_warnings": decay_warnings,
+    }
+
+
+def compute_pattern_decay(entries, playbook, recent_n=5):
+    """Compare recent vs all-time hit rates. Returns list of decay warnings."""
+    patterns = playbook.get("patterns", {})
+    warnings = []
+
+    for pid in patterns:
+        # All matches for this pattern
+        all_matches = [e for e in entries if pid in e.get("matched_patterns", [])]
+        if len(all_matches) < recent_n + 2:  # need enough data for meaningful split
+            continue
+
+        all_t1 = sum(1 for e in all_matches if e["outcome"].get("t1_hit")) / len(all_matches)
+
+        recent = all_matches[-recent_n:]
+        recent_t1 = sum(1 for e in recent if e["outcome"].get("t1_hit")) / len(recent)
+
+        if all_t1 > 0 and recent_t1 < all_t1 * 0.6:
+            warnings.append({
+                "pattern_id": pid,
+                "name": patterns[pid].get("name", pid),
+                "all_time_t1": round(all_t1, 2),
+                "recent_t1": round(recent_t1, 2),
+                "recent_n": recent_n,
+                "total_n": len(all_matches),
+            })
+
+    return warnings
+
+
 # ─── Section 2: Condition Correlations ──────────────────────────────────────
 
 def compute_condition_correlations(entries):

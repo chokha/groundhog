@@ -161,10 +161,22 @@ def match_patterns(brief_data, playbook_path=None):
 
 # ─── Terminal formatting ────────────────────────────────────────────────────
 
-def format_playbook_matches(matches):
-    """Format playbook matches for terminal output."""
+def format_playbook_matches(matches, scorecard=None, decay_warnings=None):
+    """Format playbook matches for terminal output.
+
+    Args:
+        matches: list of match dicts from match_patterns()
+        scorecard: optional dict keyed by pattern_id with stats from learn.py
+        decay_warnings: optional list of decay warning dicts from learn.py
+    """
     if not matches:
         return ""
+
+    # Index decay warnings by pattern_id for quick lookup
+    decay_by_pid = {}
+    if decay_warnings:
+        for w in decay_warnings:
+            decay_by_pid[w["pattern_id"]] = w
 
     lines = []
     lines.append("")
@@ -176,6 +188,29 @@ def format_playbook_matches(matches):
             f"  [{m['priority']:6s}] {m['name']:40s} "
             f"{m['conditions_met']}/{m['conditions_total']} ({full})"
         )
+
+        # Scorecard stats line
+        pid = m["pattern_id"]
+        if scorecard and pid in scorecard:
+            s = scorecard[pid]
+            if s["n"] > 0:
+                t1_pct = round(s["t1_rate"] * 100)
+                mfe_str = f"MFE: {s['avg_mfe']:.0f}" if s["avg_mfe"] is not None else "MFE: ---"
+                mae_str = f"MAE: {s['avg_mae']:.0f}" if s["avg_mae"] is not None else "MAE: ---"
+                lines.append(
+                    f"           T1: {s['t1_count']}/{s['n']} ({t1_pct}%)  |  "
+                    f"{mfe_str}  |  {mae_str}  |  {s['confidence']}"
+                )
+
+        # Decay warning
+        if pid in decay_by_pid:
+            w = decay_by_pid[pid]
+            all_pct = round(w["all_time_t1"] * 100)
+            recent_pct = round(w["recent_t1"] * 100)
+            lines.append(
+                f"           !! DECAY: T1 dropped from {all_pct}% (all-time) "
+                f"to {recent_pct}% (last {w['recent_n']})"
+            )
 
         if m.get("warning"):
             lines.append(f"           ** {m['warning']}")
