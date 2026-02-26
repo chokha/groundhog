@@ -6,3 +6,5 @@ nq_1m.parquet
 nq_1m_databento.parquet
 backtest_output/
 daily_briefs/
+archive/
+journal/

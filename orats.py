@@ -8,7 +8,7 @@ import json
 import requests
 import pandas as pd
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from config import ORATS_TOKEN, ORATS_BASE, QQQ_TICKER, NDX_TICKER
 
@@ -153,6 +153,123 @@ def fetch_qqq_and_ndx(trade_date: str, use_cache: bool = True) -> dict:
         "qqq": fetch_chain(QQQ_TICKER, trade_date, use_cache=use_cache),
         "ndx": fetch_chain(NDX_TICKER, trade_date, use_cache=use_cache),
     }
+
+
+# ─── LIVE chain fetch (real-time snapshots) ──────────────────────────────────
+
+FLOW_SNAPSHOT_DIR = Path("flow_snapshots")
+
+
+def fetch_live_chain(ticker: str, expiry_date: str) -> dict:
+    """
+    Fetch LIVE option chain snapshot from ORATS Live Data API.
+    Endpoint: strikes (NOT hist/strikes).
+
+    Returns:
+        {"wide": DataFrame (one row per strike, raw ORATS wide format),
+         "long": DataFrame (normalized long format for GEX computation)}
+
+    The wide frame preserves callVolume, putVolume, gamma per strike
+    needed for flow wall computation.
+    """
+    try:
+        raw = _orats_get("strikes", {
+            "ticker":    ticker,
+            "expirDate": expiry_date,
+        })
+    except requests.HTTPError as e:
+        print(f"[ORATS LIVE] HTTP error for {ticker} expiry {expiry_date}: {e}")
+        return {"wide": pd.DataFrame(), "long": pd.DataFrame()}
+
+    data = raw.get("data", raw) if isinstance(raw, dict) else raw
+    if not data:
+        print(f"[ORATS LIVE] No data for {ticker} expiry {expiry_date}")
+        return {"wide": pd.DataFrame(), "long": pd.DataFrame()}
+
+    df_wide = pd.DataFrame(data)
+
+    # Coerce volume + gamma columns to numeric
+    for col in ["strike", "dte", "gamma", "delta",
+                "callVolume", "putVolume",
+                "callOpenInterest", "putOpenInterest"]:
+        if col in df_wide.columns:
+            df_wide[col] = pd.to_numeric(df_wide[col], errors="coerce").fillna(0)
+
+    # Aggregate duplicate strikes (same strike across AM/PM settle or sub-expiries)
+    # Sum volumes and OI; volume-weighted average gamma
+    agg_cols = {
+        "callVolume": "sum",
+        "putVolume": "sum",
+        "callOpenInterest": "sum",
+        "putOpenInterest": "sum",
+    }
+    # For gamma and delta: take the row with highest total volume per strike
+    if not df_wide.empty:
+        df_wide["_total_vol"] = df_wide["callVolume"] + df_wide["putVolume"]
+        # Keep gamma/delta from the highest-volume row per strike
+        idx_best = df_wide.groupby("strike")["_total_vol"].idxmax()
+        gamma_delta = df_wide.loc[idx_best, ["strike", "gamma", "delta"]].set_index("strike")
+        # Aggregate volumes
+        vol_agg = df_wide.groupby("strike", as_index=False).agg(agg_cols)
+        vol_agg = vol_agg.merge(gamma_delta, on="strike", how="left")
+        # Preserve expiry from first row
+        if "expirDate" in df_wide.columns:
+            vol_agg["expirDate"] = df_wide["expirDate"].iloc[0]
+        elif "expiry" in df_wide.columns:
+            vol_agg["expirDate"] = df_wide["expiry"].iloc[0]
+        vol_agg["dte"] = 0
+        df_wide_agg = vol_agg
+        df_wide_agg.drop(columns=["_total_vol"], errors="ignore", inplace=True)
+    else:
+        df_wide_agg = df_wide
+
+    # Normalize to long format for existing GEX pipeline
+    df_long = _normalize_chain(df_wide_agg.copy())
+
+    return {"wide": df_wide_agg, "long": df_long}
+
+
+def fetch_live_qqq_and_ndx(expiry_date: str) -> dict:
+    """
+    Fetch LIVE 0DTE chain snapshots for both QQQ and NDX.
+    Returns: {"qqq": {"wide": df, "long": df}, "ndx": {"wide": df, "long": df}}
+    """
+    return {
+        "qqq": fetch_live_chain(QQQ_TICKER, expiry_date),
+        "ndx": fetch_live_chain(NDX_TICKER, expiry_date),
+    }
+
+
+def save_flow_snapshot(df_wide: pd.DataFrame, ticker: str, spot: float,
+                       trade_date: str, time_et: str):
+    """
+    Save a lightweight CSV of the live chain snapshot for future replay.
+    Columns: date, time, ticker, expiry, strike, callVolume, putVolume, gamma, spot
+    """
+    if df_wide.empty:
+        return
+
+    FLOW_SNAPSHOT_DIR.mkdir(exist_ok=True)
+    csv_path = FLOW_SNAPSHOT_DIR / f"flow_{ticker}_{trade_date}.csv"
+
+    snap = df_wide[["strike"]].copy()
+    snap["date"] = trade_date
+    snap["time"] = time_et
+    snap["ticker"] = ticker
+    expiry_col = "expirDate" if "expirDate" in df_wide.columns else "expiry"
+    snap["expiry"] = df_wide[expiry_col].iloc[0] if expiry_col in df_wide.columns else trade_date
+    snap["callVolume"] = df_wide.get("callVolume", 0)
+    snap["putVolume"] = df_wide.get("putVolume", 0)
+    snap["gamma"] = df_wide.get("gamma", 0)
+    snap["spot"] = spot
+
+    snap = snap[["date", "time", "ticker", "expiry", "strike",
+                 "callVolume", "putVolume", "gamma", "spot"]]
+
+    if csv_path.exists():
+        snap.to_csv(csv_path, mode="a", header=False, index=False)
+    else:
+        snap.to_csv(csv_path, mode="w", header=True, index=False)
 
 
 def get_prior_trading_date(d: date) -> date:

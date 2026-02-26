@@ -24,6 +24,34 @@ from config import (
 from gex import classify_case
 
 
+def compute_orb(bars_1m: pd.DataFrame, trade_date, start_time: str = "09:30", minutes: int = 5) -> dict:
+    """
+    Compute ORB high/low/mid from 1-min bars for a given trade date.
+    Returns None values if ORB window not yet closed (not enough bars).
+    """
+    td = date.fromisoformat(str(trade_date)) if isinstance(trade_date, str) else trade_date
+    parts = start_time.split(":")
+    st = time(int(parts[0]), int(parts[1]))
+
+    rth = bars_1m[(bars_1m["date"] == td) & (bars_1m["ts"].dt.time >= st)]
+    if len(rth) < minutes:
+        return {
+            "orb_high": None, "orb_low": None, "orb_mid": None,
+            "orb_range": None, "orb_closed": False,
+        }
+
+    orb = rth.head(minutes)
+    hi = float(orb["high"].max())
+    lo = float(orb["low"].min())
+    return {
+        "orb_high": hi,
+        "orb_low": lo,
+        "orb_mid": round((hi + lo) / 2, 2),
+        "orb_range": round(hi - lo, 1),
+        "orb_closed": True,
+    }
+
+
 def simulate_orb_day(
     rth_bars: pd.DataFrame,
     ict: dict,

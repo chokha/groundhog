@@ -1,0 +1,142 @@
+# playbook.yaml — Trading pattern rules for pre-market brief matching
+#
+# Each pattern has:
+#   conditions:  list of {field, op, value} — checked against brief JSON fields
+#   priority:    HIGH / MEDIUM / LOW
+#   bias:        LONG_BIAS / SHORT_BIAS / NEUTRAL / null
+#   bias_override: true if this pattern should override the brief's premarket_bias
+#   warning:     short string printed in the brief (or null)
+#   action:      actionable instruction
+#   notes:       context for the trader
+#
+# Condition operators:
+#   eq, gt, gte, lt, lte, in, not_in, bool, range
+#
+# A pattern matches if >= 50% of its conditions are met (partial match).
+# Full matches ranked above partials. Sorted by: full_match > priority > match_ratio.
+
+patterns:
+
+  gap_up_into_catalyst:
+    name: "Gap Up Into Catalyst"
+    priority: HIGH
+    conditions:
+      - field: gap_from_pdc
+        op: gt
+        value: 50
+      - field: has_major_earnings
+        op: bool
+        value: true
+      - field: premarket_range
+        op: gt
+        value: 120
+    bias: null
+    bias_override: false
+    warning: "Trap risk — wait for ORB confirmation"
+    action: "Do NOT chase gap. Wait for ORB close, look for fade setup."
+    notes: "Gap up into earnings/catalyst often traps longs. Price fills gap 60%+ of the time."
+
+  day2_macro_selloff:
+    name: "Day 2 of Macro Selloff"
+    priority: HIGH
+    conditions:
+      - field: regime
+        op: eq
+        value: negative
+      - field: gap_from_pdc
+        op: lt
+        value: 0
+      - field: vix_regime
+        op: in
+        value: [ELEVATED, HIGH, PANIC]
+      - field: premarket_range
+        op: gt
+        value: 120
+    bias: SHORT_BIAS
+    bias_override: true
+    warning: null
+    action: "Short bias. Continuation likely."
+    notes: "Sector repricing takes 2-3 days. Day 2 often bigger than Day 1."
+
+  relief_bounce_after_selloff:
+    name: "Relief Bounce After Selloff"
+    priority: MEDIUM
+    conditions:
+      - field: regime
+        op: eq
+        value: negative
+      - field: gap_from_pdc
+        op: gt
+        value: 0
+      - field: vix_regime
+        op: in
+        value: [ELEVATED, HIGH, PANIC]
+    bias: LONG_BIAS
+    bias_override: false
+    warning: "Cautious long — T1 only, no runner"
+    action: "Fade-able bounce. Take T1 profit, no runner."
+    notes: "Relief bounces in neg gamma typically retrace 50-61.8% then fail."
+
+  vix_mispriced:
+    name: "VIX Mispriced vs Overnight Range"
+    priority: MEDIUM
+    conditions:
+      - field: vix_regime
+        op: in
+        value: [LOW, NORMAL]
+      - field: premarket_range
+        op: gt
+        value: 150
+    bias: null
+    bias_override: false
+    warning: "VIX low but overnight range wide — expect larger moves than usual"
+    action: "Widen stops, target larger moves. VIX likely to reprice intraday."
+    notes: "When VIX is complacent but ON range is wide, intraday vol spikes."
+
+  inside_inventory_neg_gamma:
+    name: "Inside Inventory + Neg Gamma"
+    priority: MEDIUM
+    conditions:
+      - field: inside_inventory
+        op: bool
+        value: true
+      - field: regime
+        op: eq
+        value: negative
+    bias: null
+    bias_override: false
+    warning: "Structure exists but breakout overshoots — widen targets"
+    action: "Use GEX walls as triggers, not targets. Move overshoots likely."
+    notes: "Neg gamma + inside inventory = walls hold briefly then break hard."
+
+  outside_inventory_neg_gamma:
+    name: "Outside Inventory + Neg Gamma"
+    priority: HIGH
+    conditions:
+      - field: inside_inventory
+        op: bool
+        value: false
+      - field: regime
+        op: eq
+        value: negative
+    bias: null
+    bias_override: false
+    warning: "No cushion — follow the break, no fade attempts"
+    action: "No inventory support. Follow ORB break direction aggressively."
+    notes: "Outside inventory in neg gamma = no dealer cushion. Moves are one-way."
+
+  runner_wide_range:
+    name: "Runner Mode + Wide Overnight Range"
+    priority: HIGH
+    conditions:
+      - field: mode
+        op: eq
+        value: RUNNER
+      - field: premarket_range
+        op: gt
+        value: 140
+    bias: null
+    bias_override: false
+    warning: "Runner + wide range — T1 hits 90% of the time"
+    action: "Trust the ORB break. Take T1 with high confidence, trail for runner."
+    notes: "Auto-discovered: 9/10 T1 hit across 10 journal entries (Feb 2026)."

@@ -414,6 +414,209 @@ def _empty_gex(label: str = "") -> dict:
     }
 
 
+# ─── Flow wall computation (intraday volume-based) ───────────────────────────
+
+def compute_flow_walls(df_wide: pd.DataFrame, spot: float, label: str = "",
+                       pct_active: float = 0.015, pct_struct: float = 0.04) -> dict:
+    """
+    Compute intraday FLOW walls from live option chain (wide format).
+
+    Flow score per strike:
+        flow = (callVolume - putVolume) * gamma * spot^2
+
+    Positive flow → net call buying → dealers hedge long → resistance (call wall).
+    Negative flow → net put buying → dealers hedge short → support (put wall).
+
+    Args:
+        df_wide:    Wide-format DataFrame with columns:
+                    strike, callVolume, putVolume, gamma
+        spot:       Current underlying price
+        label:      "qqq" or "ndx" for logging
+        pct_active: Active window as fraction of spot (default ±1.5%)
+        pct_struct: Structural window as fraction of spot (default ±4%)
+
+    Returns dict with:
+        flow_call_wall, flow_put_wall (active + struct),
+        nearest_flow_above, nearest_flow_below,
+        top_nodes_flow (top 8 by |flow| near spot),
+        by_strike_flow DataFrame
+    """
+    empty = _empty_flow(label)
+
+    if df_wide.empty:
+        return empty
+
+    # Verify required columns
+    for col in ("strike", "callVolume", "putVolume", "gamma"):
+        if col not in df_wide.columns:
+            print(f"[FLOW] {label}: missing column '{col}' — skipping flow walls")
+            return empty
+
+    df = df_wide.copy()
+    df["callVolume"] = pd.to_numeric(df["callVolume"], errors="coerce").fillna(0)
+    df["putVolume"]  = pd.to_numeric(df["putVolume"], errors="coerce").fillna(0)
+    df["gamma"]      = pd.to_numeric(df["gamma"], errors="coerce").fillna(0)
+
+    # ── Per-strike flow score ────────────────────────────────────────────────
+    df["flow"] = (df["callVolume"] - df["putVolume"]) * df["gamma"] * (spot ** 2)
+
+    # Aggregate by strike (should already be unique after orats aggregation,
+    # but defensive)
+    by_strike = (
+        df.groupby("strike", as_index=False)
+        .agg({"flow": "sum", "callVolume": "sum", "putVolume": "sum", "gamma": "first"})
+        .sort_values("strike")
+        .reset_index(drop=True)
+    )
+
+    # Filter out zero-flow strikes
+    by_strike = by_strike[by_strike["flow"].abs() > 0].reset_index(drop=True)
+    if by_strike.empty:
+        return empty
+
+    # ── Windows ──────────────────────────────────────────────────────────────
+    lo_a, hi_a = spot * (1 - pct_active), spot * (1 + pct_active)
+    lo_s, hi_s = spot * (1 - pct_struct), spot * (1 + pct_struct)
+    active = by_strike[(by_strike["strike"] >= lo_a) & (by_strike["strike"] <= hi_a)]
+    struct = by_strike[(by_strike["strike"] >= lo_s) & (by_strike["strike"] <= hi_s)]
+
+    # ── Flow call wall: max positive flow at or above spot (resistance) ──────
+    def _find_flow_call_wall(window):
+        above = window[(window["strike"] >= spot) & (window["flow"] > 0)]
+        if above.empty:
+            return None
+        return float(above.loc[above["flow"].idxmax(), "strike"])
+
+    # ── Flow put wall: min (most negative) flow at or below spot (support) ──
+    def _find_flow_put_wall(window):
+        below = window[(window["strike"] <= spot) & (window["flow"] < 0)]
+        if below.empty:
+            return None
+        return float(below.loc[below["flow"].idxmin(), "strike"])
+
+    flow_call_wall_active = _find_flow_call_wall(active)
+    flow_put_wall_active  = _find_flow_put_wall(active)
+    flow_call_wall_struct = _find_flow_call_wall(struct)
+    flow_put_wall_struct  = _find_flow_put_wall(struct)
+
+    # ── Top nodes by |flow| near spot (struct window) ────────────────────────
+    top_k = 8
+    if not struct.empty:
+        top_struct = struct.reindex(
+            struct["flow"].abs().sort_values(ascending=False).index
+        ).head(top_k)
+        top_nodes_flow = sorted(top_struct["strike"].tolist())
+    else:
+        top_nodes_flow = []
+
+    # ── Nearest flow resistance above / support below ────────────────────────
+    # Use actual flow data, not just top-k: nearest positive-flow strike above
+    # spot (call resistance) and nearest negative-flow strike below spot (put
+    # support) within the structural window.
+    pos_above = struct[(struct["strike"] > spot + 2) & (struct["flow"] > 0)]
+    neg_below = struct[(struct["strike"] < spot - 2) & (struct["flow"] < 0)]
+    nearest_flow_above = float(pos_above["strike"].min()) if not pos_above.empty else None
+    nearest_flow_below = float(neg_below["strike"].max()) if not neg_below.empty else None
+    flow_air_up = round(nearest_flow_above - spot, 1) if nearest_flow_above else None
+    flow_air_dn = round(spot - nearest_flow_below, 1) if nearest_flow_below else None
+
+    return {
+        "label": label,
+        "flow_call_wall_active": flow_call_wall_active,
+        "flow_put_wall_active":  flow_put_wall_active,
+        "flow_call_wall_struct": flow_call_wall_struct,
+        "flow_put_wall_struct":  flow_put_wall_struct,
+        "nearest_flow_above":    nearest_flow_above,
+        "nearest_flow_below":    nearest_flow_below,
+        "flow_air_up":           flow_air_up,
+        "flow_air_dn":           flow_air_dn,
+        "top_nodes_flow":        top_nodes_flow,
+        "by_strike_flow":        by_strike,
+    }
+
+
+def combine_flow_walls(qqq_flow: dict, ndx_flow: dict,
+                       spot_nq: float, basis: float = 0) -> dict:
+    """
+    Combine QQQ and NDX flow walls onto NQ scale.
+    Prefer NDX-derived walls if available; fall back to QQQ-derived.
+    NDX strikes shifted to NQ using basis (NQ - NDX premium).
+    QQQ strikes shifted to NQ using spot_nq / spot_qqq ratio (≈40x).
+    """
+    def to_nq_ndx(level):
+        return round(level + basis, 2) if level is not None else None
+
+    # Primary: NDX flow walls (same price scale as NQ)
+    ndx_avail = ndx_flow.get("flow_call_wall_active") is not None
+    qqq_avail = qqq_flow.get("flow_call_wall_active") is not None
+
+    if ndx_avail:
+        primary = ndx_flow
+        source = "NDX"
+        convert = to_nq_ndx
+    elif qqq_avail:
+        # QQQ → NQ conversion not meaningful (different price scale)
+        # QQQ is $600 scale, NQ is $25000 scale — walls cannot be shifted
+        # Use QQQ flow data as informational only
+        primary = qqq_flow
+        source = "QQQ (cannot convert to NQ)"
+        convert = lambda x: None  # QQQ strikes are not NQ-compatible
+    else:
+        return _empty_flow_combined()
+
+    result = {
+        "source": source,
+        "flow_call_wall":    convert(primary.get("flow_call_wall_active")),
+        "flow_put_wall":     convert(primary.get("flow_put_wall_active")),
+        "flow_call_struct":  convert(primary.get("flow_call_wall_struct")),
+        "flow_put_struct":   convert(primary.get("flow_put_wall_struct")),
+        "nearest_flow_above": convert(primary.get("nearest_flow_above")),
+        "nearest_flow_below": convert(primary.get("nearest_flow_below")),
+        "flow_air_up":       primary.get("flow_air_up"),
+        "flow_air_dn":       primary.get("flow_air_dn"),
+        "top_nodes_flow":    [convert(n) for n in primary.get("top_nodes_flow", [])
+                              if convert(n) is not None],
+        # Keep raw flow data for debug
+        "ndx_flow": ndx_flow,
+        "qqq_flow": qqq_flow,
+    }
+
+    return result
+
+
+def _empty_flow(label: str = "") -> dict:
+    return {
+        "label": label,
+        "flow_call_wall_active": None,
+        "flow_put_wall_active":  None,
+        "flow_call_wall_struct": None,
+        "flow_put_wall_struct":  None,
+        "nearest_flow_above":    None,
+        "nearest_flow_below":    None,
+        "flow_air_up":           None,
+        "flow_air_dn":           None,
+        "top_nodes_flow":        [],
+        "by_strike_flow":        pd.DataFrame(),
+    }
+
+
+def _empty_flow_combined() -> dict:
+    return {
+        "source": "N/A",
+        "flow_call_wall":    None,
+        "flow_put_wall":     None,
+        "flow_call_struct":  None,
+        "flow_put_struct":   None,
+        "nearest_flow_above": None,
+        "nearest_flow_below": None,
+        "flow_air_up":       None,
+        "flow_air_dn":       None,
+        "top_nodes_flow":    [],
+        "ndx_flow": _empty_flow("ndx"),
+        "qqq_flow": _empty_flow("qqq"),
+    }
+
+
 def classify_case(gex: dict, sweep_occurred: bool, sweep_direction: Optional[str]) -> str:
     """
     Classify day type based on GEX regime + sweep outcome.
